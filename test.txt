@@ -1,0 +1,189 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <math.h>
+
+// --- Wi-Fi Configuration ---
+const char* ssid     = "TP-Link_9D2C";     
+const char* password = "40266497"; 
+
+
+// --- Hardware Pin Configurations ---
+constexpr int SDA_PIN = 21;
+constexpr int SCL_PIN = 22;
+constexpr uint8_t PT2258_ADDR = 0x40;
+constexpr int MAX_OUTPUT_ATTENUATION_DB = 7;
+
+// --- Volume Variables ---
+int currentPercent[2] = {50, 50}; // Index 0 = Channel 2, Index 1 = Channel 4
+int targetPercent[2]  = {50, 50};
+unsigned long lastRampMs[2] = {0, 0};
+constexpr uint32_t RAMP_INTERVAL_MS = 4; // Smooth 4ms ramping steps
+
+WebServer server(80);
+
+// VERIFIED MULTI-SEGMENT AUDIO TAPER CURVE
+int percentToAttenuationLog(int percent) {
+  percent = constrain(percent, 0, 100);
+  if (percent == 0) return 79; // Dead silent
+
+  int attenuation = 79;
+
+  // Segment 1: Low Volume Range (1% to 15%)
+  if (percent <= 15) {
+    attenuation = map(percent, 1, 15, 79, 46);
+  } 
+  // Segment 2: Main Listening Range (16% to 70%)
+  else if (percent <= 70) {
+    attenuation = map(percent, 16, 70, 45, 18);
+  } 
+  // Segment 3: High Power Range (71% to 100%)
+  else {
+    attenuation = map(percent, 71, 100, 17, MAX_OUTPUT_ATTENUATION_DB);
+  }
+
+  return constrain(attenuation, MAX_OUTPUT_ATTENUATION_DB, 79);
+}
+
+// Low-level I2C Transmission Layer
+bool setChannelAttenuation(uint8_t channel, int attenuationDb) {
+  attenuationDb = constrain(attenuationDb, 0, 79);
+  uint8_t tens = attenuationDb / 10;
+  uint8_t ones = attenuationDb % 10;
+  uint8_t tenDbCommand = 0;
+  uint8_t oneDbCommand = 0;
+
+  if (channel == 2) {
+    tenDbCommand = 0x40 | tens;
+    oneDbCommand = 0x50 | ones;
+  } else if (channel == 4) {
+    tenDbCommand = 0x20 | tens;
+    oneDbCommand = 0x30 | ones;
+  } else {
+    return false;
+  }
+
+  Wire.beginTransmission(PT2258_ADDR);
+  Wire.write(tenDbCommand);
+  Wire.write(oneDbCommand);
+  return Wire.endTransmission() == 0;
+}
+
+// --- HTML / CSS / JavaScript Linear Slider Dashboard ---
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Audio Control Deck</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #121212; color: #E0E0E0; text-align: center; padding: 20px; user-select: none; }
+        .container { max-width: 500px; margin: 40px auto; background: #1E1E1E; padding: 30px; border-radius: 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.6); }
+        h1 { color: #ffffff; font-size: 22px; font-weight: 600; margin-bottom: 35px; letter-spacing: 0.5px; }
+        .slider-group { margin-bottom: 40px; text-align: left; }
+        label { font-size: 16px; font-weight: 600; display: block; margin-bottom: 12px; color: #FFFFFF; letter-spacing: 0.3px; }
+        .slider-wrapper { display: flex; align-items: center; justify-content: space-between; }
+        input[type=range] { -webkit-appearance: none; width: 78%; height: 10px; border-radius: 5px; background: #2C2C2C; outline: none; }
+        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 26px; height: 26px; border-radius: 50%; background: #f7f9f9; cursor: pointer; box-shadow: 0 2px 6px rgba(0,0,0,0.5); transition: background 0.1s; }
+        input[type=range]::-webkit-slider-thumb:active { background: #FFFFFF; }
+        .val-display { font-size: 18px; font-weight: 700; width: 18%; text-align: right; color: #FFFFFF; font-variant-numeric: tabular-nums; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Wireless Volume Interface</h1>
+        
+        <div class="slider-group">
+            <label>Channel 1</label>
+            <div class="slider-wrapper">
+                <input type="range" id="ch2" min="0" max="100" value="50" oninput="updateVolume(2, this.value)">
+                <span id="ch2Val" class="val-display">50%</span>
+            </div>
+        </div>
+        
+        <div class="slider-group">
+            <label>Channel 2</label>
+            <div class="slider-wrapper">
+                <input type="range" id="ch4" min="0" max="100" value="50" oninput="updateVolume(4, this.value)">
+                <span id="ch4Val" class="val-display">50%</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function updateVolume(channel, val) {
+            document.getElementById('ch' + channel + 'Val').innerText = val + '%';
+            // Send asynchronous API frame completely decoupled from UI thread
+            fetch('/setvol?ch=' + channel + '&val=' + val)
+            .catch(err => console.error('Transmission failed:', err));
+        }
+    </script>
+</body>
+</html>
+)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+void handleSetVolume() {
+  if (server.hasArg("ch") && server.hasArg("val")) {
+    int ch = server.arg("ch").toInt();
+    int val = server.arg("val").toInt();
+    if ((ch == 2 || ch == 4) && val >= 0 && val <= 100) {
+      int index = (ch == 2) ? 0 : 1;
+      targetPercent[index] = val; 
+      server.send(200, "text/plain", "OK");
+      return;
+    }
+  }
+  server.send(400, "text/plain", "Bad Request");
+}
+
+void processVolumeRamps() {
+  unsigned long now = millis();
+  for (int i = 0; i < 2; i++) {
+    if (currentPercent[i] != targetPercent[i]) {
+      if (now - lastRampMs[i] >= RAMP_INTERVAL_MS) {
+        lastRampMs[i] = now;
+        currentPercent[i] += (targetPercent[i] > currentPercent[i]) ? 1 : -1;
+        setChannelAttenuation((i == 0) ? 2 : 4, percentToAttenuationLog(currentPercent[i]));
+      }
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(20000); 
+
+  Wire.beginTransmission(PT2258_ADDR);
+  Wire.write(0xC0); 
+  Wire.endTransmission();
+  delay(5);
+
+  setChannelAttenuation(2, percentToAttenuationLog(currentPercent[0]));
+  delayMicroseconds(500);
+  setChannelAttenuation(4, percentToAttenuationLog(currentPercent[1]));
+
+  Serial.print("Connecting to Wi-Fi.");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println("\nWi-Fi Connected successfully.");
+  Serial.print("Dashboard Link: http://");
+  Serial.println(WiFi.localIP()); 
+
+  server.on("/", handleRoot);
+  server.on("/setvol", handleSetVolume);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  processVolumeRamps();
+}
